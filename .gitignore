@@ -1,0 +1,24 @@
+# Build output (Keil MDK / ARMCC)
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.dep
+*.lnp
+*.sct
+*.iex
+*.uvguix.*
+Objects/
+Listings/
+DebugConfig/
+RTE/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
