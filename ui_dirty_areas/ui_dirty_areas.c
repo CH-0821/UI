@@ -16,8 +16,9 @@ typedef struct
   int16_t y1;
 } ui_dirty_rect_t;
 
-/* 绘制裁剪：矩形 + 统一圆角半径（0 = 直角）。
- * 圆角裁剪本质是"逐行区间"：每行按四角内缩后得到 [x0+d, x1-d]，
+/* 绘制裁剪：矩形 + 四角可选圆角（radius = 0 / corners = 0 = 直角）。
+ * 圆形父对象用"外接方框 + 半径 = 外半径 + 四角全选"表示。
+ * 圆角裁剪本质是"逐行区间"：每行按左右两侧各自的圆角内缩后得到 [x0+dl, x1-dr]，
  * 所以多层裁剪只要逐行求交就是精确的（见 clip_row_range） */
 typedef struct
 {
@@ -26,8 +27,12 @@ typedef struct
   int16_t y0;
   int16_t x1;
   int16_t y1;
-  uint8_t radius;
+  int16_t radius;
+  uint8_t corners;              /* UI_CLIP_ROUND_* 掩码：哪几个角要圆 */
 }ui_row_clip_t;
+
+/* 端点归一（前向声明：下面的 ui_clip_shape_contains 在定义之前就要用） */
+static void clip_normalize(int16_t* x0, int16_t* y0, int16_t* x1, int16_t* y1);
 
 /* ---- 本模块的全部状态 --------------------------------------------------
  * 脏矩形表 + 乒乓行缓冲 + 当前推送进度，就这一份、只在本文件可见 */
@@ -113,38 +118,94 @@ static uint32_t clip_isqrt(uint32_t v)
   return r;
 }
 
-/* 圆角裁剪在屏幕行 y 上的左右内缩量（四角同一半径）；中间行 / 直角返回 0。
- * 公式和 ui_tool_round_rect_row_ex 完全一致，裁剪边界和画出来的圆角逐像素对齐 */
-static int16_t clip_row_inset(const ui_row_clip_t *c, int16_t y)
+/* 圆角裁剪在屏幕行 y 上的左右内缩量（四角可分别选）；中间行 / 直角返回 0。
+ * 公式和 ui_tool_round_rect_row_ex 完全一致，裁剪边界和画出来的圆角逐像素对齐。
+ * 上、下两条圆角带不会重叠（半径已夹到 min(w,h)/2），所以左右内缩互不影响 */
+static void clip_row_inset_pair(const ui_row_clip_t *c, int16_t y,
+                                int16_t *dl, int16_t *dr)
 {
-  int16_t r  = (int16_t)c->radius;
+  int16_t r  = c->radius;
   int16_t dy;
+  int16_t d;
 
-  if (r <= 0)
+  *dl = 0;
+  *dr = 0;
+
+  if (r <= 0 || c->corners == 0u)
   {
-    return 0;
+    return;
   }
 
   if (y < (int16_t)(c->y0 + r))                 /* 上端圆角那几行 */
   {
     dy = (int16_t)(c->y0 + r - y);
+    d  = (int16_t)(r - (int16_t)clip_isqrt((uint32_t)((int32_t)r * r - (int32_t)dy * dy)));
+
+    if ((c->corners & UI_CLIP_ROUND_TOP_LEFT)  != 0u) { *dl = d; }
+    if ((c->corners & UI_CLIP_ROUND_TOP_RIGHT) != 0u) { *dr = d; }
   }
   else if (y > (int16_t)(c->y1 - r))            /* 下端圆角那几行 */
   {
     dy = (int16_t)(y - (c->y1 - r));
+    d  = (int16_t)(r - (int16_t)clip_isqrt((uint32_t)((int32_t)r * r - (int32_t)dy * dy)));
+
+    if ((c->corners & UI_CLIP_ROUND_BOTTOM_LEFT)  != 0u) { *dl = d; }
+    if ((c->corners & UI_CLIP_ROUND_BOTTOM_RIGHT) != 0u) { *dr = d; }
   }
-  else
+}
+
+/* 一个点是否落在"矩形 + 四角圆角"形状内：公式和绘制裁剪完全一致。
+ * 命中测试用：圆角/圆形父对象外接框的四个死角不该被点到 */
+uint8_t ui_clip_shape_contains(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                               int16_t radius, uint8_t corners, int16_t x, int16_t y)
+{
+  ui_row_clip_t c;
+  int16_t w, h, rmax, dl, dr;
+
+  clip_normalize(&x0, &y0, &x1, &y1);
+
+  if (x < x0 || x > x1 || y < y0 || y > y1)
   {
-    return 0;                                   /* 中间整宽 */
+    return 0u;
   }
 
-  return (int16_t)(r - (int16_t)clip_isqrt((uint32_t)((int32_t)r * r - (int32_t)dy * dy)));
+  w = (int16_t)(x1 - x0 + 1);
+  h = (int16_t)(y1 - y0 + 1);
+  if (w <= 0 || h <= 0)
+  {
+    return 0u;
+  }
+
+  rmax = (int16_t)((w < h ? w : h) >> 1);
+  if (radius > rmax)
+  {
+    radius = rmax;
+  }
+  if (radius <= 0 || corners == 0u)
+  {
+    return 1u;                                 /* 直角矩形：已经在框内 */
+  }
+
+  c.on      = 1u;
+  c.x0      = x0;
+  c.y0      = y0;
+  c.x1      = x1;
+  c.y1      = y1;
+  c.radius  = radius;
+  c.corners = corners;
+
+  clip_row_inset_pair(&c, y, &dl, &dr);
+  if (x < (int16_t)(x0 + dl) || x > (int16_t)(x1 - dr))
+  {
+    return 0u;
+  }
+  return 1u;
 }
 
 /* 把一层裁剪并进 [*l, *r]；返回 0 = 这一行被它整行挡掉 */
 static uint8_t clip_apply(const ui_row_clip_t *c, int16_t y, int16_t *l, int16_t *r)
 {
-  int16_t d;
+  int16_t dl, dr;
 
   if (c->on == 0u)
   {
@@ -155,9 +216,9 @@ static uint8_t clip_apply(const ui_row_clip_t *c, int16_t y, int16_t *l, int16_t
     return 0u;
   }
 
-  d = clip_row_inset(c, y);
-  if ((int16_t)(c->x0 + d) > *l) { *l = (int16_t)(c->x0 + d); }
-  if ((int16_t)(c->x1 - d) < *r) { *r = (int16_t)(c->x1 - d); }
+  clip_row_inset_pair(c, y, &dl, &dr);
+  if ((int16_t)(c->x0 + dl) > *l) { *l = (int16_t)(c->x0 + dl); }
+  if ((int16_t)(c->x1 - dr) < *r) { *r = (int16_t)(c->x1 - dr); }
   return 1u;
 }
 
@@ -434,8 +495,11 @@ void ui_row_clip_set(int16_t x0, int16_t y0, int16_t x1, int16_t y1)
   ui_row_clip_set_round(x0, y0, x1, y1, 0u);
 }
 
-/* 设一段圆角裁剪：四角同一半径（0 = 矩形）。radius 内部夹到 min(w,h)/2 */
-void ui_row_clip_set_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t radius)
+/* 设一段圆角裁剪：corners 指定哪几个角要圆（UI_CLIP_ROUND_*），
+ * radius 只对选中的角生效。radius 内部夹到 min(w,h)/2。
+ * 圆形对象传 corners = ALL、radius = 外半径即可精确成圆 */
+void ui_row_clip_set_round_ex(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                              int16_t radius, uint8_t corners)
 {
   int16_t w, h, rmax;
 
@@ -446,27 +510,39 @@ void ui_row_clip_set_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8
   if (w <= 0 || h <= 0)
   {
     /* 空矩形 = 整片都不可见：给一个 left > right 的区间（别把裁剪关掉） */
-    ui_state.clip.on     = 1u;
-    ui_state.clip.x0     = 1;
-    ui_state.clip.y0     = 0;
-    ui_state.clip.x1     = 0;
-    ui_state.clip.y1     = 0;
-    ui_state.clip.radius = 0u;
+    ui_state.clip.on      = 1u;
+    ui_state.clip.x0      = 1;
+    ui_state.clip.y0      = 0;
+    ui_state.clip.x1      = 0;
+    ui_state.clip.y1      = 0;
+    ui_state.clip.radius  = 0u;
+    ui_state.clip.corners = 0u;
     return;
   }
 
   rmax = (int16_t)((w < h ? w : h) >> 1);
-  if ((int32_t)radius > (int32_t)rmax)
+  if (radius > rmax)
   {
-    radius = (uint8_t)rmax;                    /* rmax > 255 时上面这个判断不成立，不会被 8 位截断 */
+    radius = rmax;                             /* 夹到短边的一半：上下圆角带不会重叠 */
+  }
+  if (radius <= 0)
+  {
+    radius  = 0;
+    corners = 0u;                              /* 半径为 0 = 直角，角掩码没意义 */
   }
 
-  ui_state.clip.on     = 1u;
-  ui_state.clip.x0     = x0;
-  ui_state.clip.y0     = y0;
-  ui_state.clip.x1     = x1;
-  ui_state.clip.y1     = y1;
-  ui_state.clip.radius = radius;
+  ui_state.clip.on      = 1u;
+  ui_state.clip.x0      = x0;
+  ui_state.clip.y0      = y0;
+  ui_state.clip.x1      = x1;
+  ui_state.clip.y1      = y1;
+  ui_state.clip.radius  = radius;
+  ui_state.clip.corners = corners;
+}
+
+void ui_row_clip_set_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t radius)
+{
+  ui_row_clip_set_round_ex(x0, y0, x1, y1, radius, UI_CLIP_ROUND_ALL);
 }
 
 void ui_row_clip_clear(void)
@@ -477,7 +553,8 @@ void ui_row_clip_clear(void)
 /* 绘制裁剪入栈：先保存当前层，再把新的一层设为当前。
  * 有效范围是"栈里所有层 ∩ 当前层"逐行求交（见 clip_row_range）。
  * 栈满时退化成"矩形求交、不保存"——只保证不漏画，圆角信息丢失 */
-void ui_row_clip_push_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t radius)
+void ui_row_clip_push_round_ex(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                               int16_t radius, uint8_t corners)
 {
   clip_normalize(&x0, &y0, &x1, &y1);
 
@@ -485,11 +562,11 @@ void ui_row_clip_push_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint
   {
     ui_clip_stack[ui_clip_depth] = ui_state.clip;
     ui_clip_depth++;
-    ui_row_clip_set_round(x0, y0, x1, y1, radius);
+    ui_row_clip_set_round_ex(x0, y0, x1, y1, radius, corners);
     return;
   }
 
-  /* 栈满：和当前层求交后直接替换，不保存 */
+  /* 栈满：和当前层求交后直接替换，不保存（圆角信息只能丢掉） */
   if (ui_state.clip.on != 0u)
   {
     if (x0 < ui_state.clip.x0) { x0 = ui_state.clip.x0; }
@@ -497,12 +574,17 @@ void ui_row_clip_push_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint
     if (x1 > ui_state.clip.x1) { x1 = ui_state.clip.x1; }
     if (y1 > ui_state.clip.y1) { y1 = ui_state.clip.y1; }
   }
-  ui_row_clip_set_round(x0, y0, x1, y1, 0u);
+  ui_row_clip_set_round(x0, y0, x1, y1, 0);
+}
+
+void ui_row_clip_push_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t radius)
+{
+  ui_row_clip_push_round_ex(x0, y0, x1, y1, radius, UI_CLIP_ROUND_ALL);
 }
 
 void ui_row_clip_push(int16_t x0, int16_t y0, int16_t x1, int16_t y1)
 {
-  ui_row_clip_push_round(x0, y0, x1, y1, 0u);
+  ui_row_clip_push_round(x0, y0, x1, y1, 0);
 }
 
 void ui_row_clip_pop(void)

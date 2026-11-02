@@ -75,6 +75,21 @@ uint8_t ui_obj_set_alpha(ui_object_t *obj, uint8_t alpha);
 uint8_t ui_obj_frame(ui_object_t *obj, int16_t *cx, int16_t *cy, int16_t *w, int16_t *h);
 
 
+/* ---- 按对象树绘制 ---------------------------------------------------------- */
+
+/* 按 z 序画一个层级，并递归它每个根对象的 children。
+ * 顺序：父对象自己 -> 子对象（按 children 链的顺序，越靠后越上层）。
+ * 父对象 clip_children = 1 时，子对象绘制前按父对象的【真实形状】压裁剪区：
+ *   圆形 -> 按当前外半径裁圆；矩形 / 组件 -> 按自己的 corners / radius 裁圆角；
+ *   其它 -> 用 clip_radius 手工指定（0 = 直角）。
+ * 超出形状的部分自动截断，嵌套父对象时裁剪逐层求交。
+ * 与 ui_level_draw 的区别：ui_level_draw 只画 level->draws 上的根对象，
+ * 不认识对象树 —— 用了父子对象就调本函数（ui_app.c 已经切到它）。
+ * visit 的口径和 ui_level_draw 一样：只对 para 非空的对象调，回调里自己
+ * ui_draw_dispatch(obj->para)；para 为空的纯容器不回调，但子对象照画。 */
+void ui_level_draw_tree(ui_hierarchy_t *level, void (*visit)(ui_object_t *obj));
+
+
 /* ---- 链级组开关（同一层级内的"视图 / 浮层"整体显隐） ----------------------- */
 
 /* 激活(on=1) / 去激活(on=0)一整条链。

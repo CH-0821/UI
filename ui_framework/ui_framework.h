@@ -90,6 +90,22 @@ typedef struct ui_object_t
    * exts 必须先由 UI_InitObject 建成空链（哨兵自指），挂扩展时才认得出"这个对象还没有扩展" */
   list_head_t exts;
 
+  /* ---- 对象树（父子关系） -------------------------------------------------
+   * 子对象不挂在层级的 draws 上，由父对象在绘制 / 命中时递归带着走：
+   * 画完父对象自己，再按 children 的顺序画子对象（越靠后越上层）。
+   * 坐标仍是【屏幕绝对坐标】（和全工程一致），父子关系只决定"谁带着谁画 /
+   * 谁带着谁命中 / 父对象平移时谁跟着走"，不做相对坐标换算。
+   * clip_children = 1 时，子对象超出父对象的部分会被裁掉，裁剪形状跟着父对象走：
+   *   · 圆形父对象 -> 按当前外半径裁成圆（父对象缩放时半径跟着变）；
+   *   · 矩形 / 组件 -> 按它们自己的 corners / radius 裁圆角；
+   *   · 其它类型 -> 用 clip_radius 手工指定（0 = 直角）。
+   * 这是默认值（和 LVGL 的"子对象默认被父对象裁剪"一致）；0 = 溢出可见。 */
+  struct ui_object_t* parent;       /* 父对象；NULL = 根对象（直接挂 level->draws） */
+  list_head_t children;             /* 子对象链头（哨兵）：上面挂 ui_object_t 的 child_node */
+  list_head_t child_node;           /* 本对象挂到 parent->children 上的节点 */
+  uint8_t clip_children;            /* 1 = 子对象裁剪到本对象形状内（默认）；0 = 溢出可见 */
+  int16_t clip_radius;              /* 手工圆角覆盖（0 = 按父对象自身形状自动） */
+
   ui_activation_t activation;       /* 对象是否激活*/
 }ui_object_t;
 
@@ -170,9 +186,10 @@ void UI_InitHierarchy(ui_hierarchy_t* level);
  * 只建立结构、不参与挂载顺序，所以可以先初始化所有链，再逐条挂到层级上；
  * 对象要在链挂到层级之后才能注册（draws 在层级上） */
 void UI_InitChain(ui_chain_t* chain);
-/* 初始化一个 UI 对象：建立"没有挂链 / 没有扩展 / 没有可绘制优先级"的初始状态
+/* 初始化一个 UI 对象：建立"没有挂链 / 没有扩展 / 没有可绘制优先级 / 没有父子"的初始状态
  * 对象在当 ui_obj 使用前必须先初始化：要么调用本函数，要么静态初始化时把
- * ops_node / draw_node / exts 三个哨兵都写成自指（LIST_HEAD_INIT）
+ * ops_node / draw_node / exts / children / child_node 五个哨兵都写成自指（LIST_HEAD_INIT），
+ * 并把 parent 置 NULL、clip_children 置 1（默认裁剪子对象）
  * 只建立结构、不参与挂载，所以可以先初始化对象、再设 para，最后走注册 / 扩展接口；
  * 注册 / 挂扩展都要求对象 inited == 1，否则 ops_node / exts 不可信 */
 void UI_InitObject(ui_object_t* obj);
@@ -233,6 +250,26 @@ ui_reg_result_t UI_RegisterObject_Ext(ui_object_t* ui_obj, ui_ext_node_t* ext);
 void UI_UnregisterObject_Ext(ui_ext_node_t* ext);
 /* 在 ui_obj 上找身份是 key 的扩展，返回它的 data；没找到（或对象还没初始化 / 还没挂过任何扩展）返回 NULL */
 void* UI_GetObject_Ext(ui_object_t* ui_obj, const void* key);
+
+
+/* ---- 对象树：把对象挂成另一个对象的子对象 --------------------------------
+ * 子对象只由父对象带着绘制 / 命中，不挂链、也不进 level->draws；
+ * 兄弟之间的顺序 = 绘制顺序，越靠后越上层（和 draws 的口径一致）。
+ * 坐标是屏幕绝对坐标，父子关系不做坐标换算；父对象平移时子树一起搬。
+ * 参数校验：parent / child 不能为 NULL、都必须已初始化（inited == 1）；
+ * child 必须是"根对象"（没有父对象、没挂链、没进绘制表），不能形成环；
+ * prev 非 NULL 时必须已经是 parent 的子对象（插到它之后）；
+ * prev 传 NULL 表示插成本对象的第一个子对象。校验不过直接返回 UI_REG_FAIL，
+ * 什么都不改。
+ * 【注意】挂成子对象后不能再调 UI_RegisterObject_Chain / _Draw / _Node ——
+ * 那会把同一棵子树重复画一遍。也不要让同一个对象既挂进视窗/合并对象的
+ * para->list、又挂进 children：两条容器机制都会把它带着走，平移会走两次。 */
+ui_reg_result_t UI_RegisterObject_Child(ui_object_t* parent, ui_object_t* child, ui_object_t* prev);
+
+/* 把 child 从它父对象的 children 上摘下（子树仍挂在 child 自己下面，不会被拆散）。
+ * child 没有父对象时什么都不做。摘完 child 可以重新挂成别的对象的子对象，
+ * 也可以再走 UI_RegisterObject_* 当根对象。 */
+void UI_UnregisterObject_Child(ui_object_t* child);
 
 /* 注册一个层级：把 level 挂到 parent 下、插在同一父级的上一兄弟层级 prev 之后
  *  parent 填 NULL 表示注册根层级，此时 level->parent 指向自己；prev 填 NULL 表示挂成父层级的第一条子层级

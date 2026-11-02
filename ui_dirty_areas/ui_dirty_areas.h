@@ -146,9 +146,27 @@ void ui_row_clip_clear(void);
 
 /* 圆角裁剪：四角同一半径（0 = 矩形），每行按圆角内缩后再当矩形裁剪用。
  * 半径内部夹到 min(w,h)/2；内缩公式和 ui_tool_round_rect_row_ex 完全一致，
- * 所以拿它裁"按同一半径画的圆角窗口"时，内容不会从四个圆角缺口里漏出来。
- * 半径上限 255（受 uint8_t 限制），常规卡片 8~24 足够 */
-void ui_row_clip_set_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t radius);
+ * 所以拿它裁"按同一半径画的圆角窗口"时，内容不会从四个圆角缺口里漏出来 */
+void ui_row_clip_set_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t radius);
+
+/* 角掩码：和 ui_tool.h 的 UI_ROUND_* 同一套位（1=左上 / 2=右上 / 4=左下 / 8=右下）。
+ * 裁剪层要能和圆角矩形（只圆某几个角）逐像素对齐，自己留一份，不反向依赖 ui_tool */
+#define UI_CLIP_ROUND_TOP_LEFT      0x1u
+#define UI_CLIP_ROUND_TOP_RIGHT     0x2u
+#define UI_CLIP_ROUND_BOTTOM_LEFT   0x4u
+#define UI_CLIP_ROUND_BOTTOM_RIGHT  0x8u
+#define UI_CLIP_ROUND_ALL           0x0Fu
+
+/* 带四角掩码的圆角裁剪：corners 指定哪几个角要圆；radius 只对选中的角生效。
+ * 圆形对象可以用"外接方框 + radius = 外半径 + corners = ALL"精确表示：
+ * 半径夹到 min(w,h)/2 后，四段 1/4 圆正好拼成一个圆 */
+void ui_row_clip_set_round_ex(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                              int16_t radius, uint8_t corners);
+
+/* 一个点是否落在"矩形 + 四角圆角"形状内：和绘制裁剪用同一套逐行内缩公式。
+ * 命中测试用它把"圆角/圆形父对象外、方形外接框内的死角"挡掉 */
+uint8_t ui_clip_shape_contains(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                               int16_t radius, uint8_t corners, int16_t x, int16_t y);
 
 /* 可嵌套的裁剪：入栈当前裁剪并压上新的一个（和上一层求交），出栈时还原。
  * 容器对象（视窗）绘制子对象时用它 —— 多个容器嵌套时，内层裁剪自动夹在外层里面；
@@ -157,7 +175,11 @@ void ui_row_clip_set_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8
 void ui_row_clip_push(int16_t x0, int16_t y0, int16_t x1, int16_t y1);
 
 /* 带圆角的可嵌套裁剪（参数含义同 ui_row_clip_set_round） */
-void ui_row_clip_push_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t radius);
+void ui_row_clip_push_round(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t radius);
+
+/* 带四角掩码的可嵌套裁剪（参数含义同 ui_row_clip_set_round_ex） */
+void ui_row_clip_push_round_ex(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                               int16_t radius, uint8_t corners);
 void ui_row_clip_pop(void);
 
 /* ---- 标脏裁剪 --------------------------------------------------------

@@ -68,6 +68,11 @@ void UI_InitObject(ui_object_t* obj)
   obj->chain      = NULL;            /* 还没挂到任何链上 */
   obj->registered = 0;               /* 还没注册过 */
   ListInit(&obj->exts);           /* 还没有上层扩展：扩展链表是空链 */
+  obj->parent     = NULL;            /* 还没有父对象：默认是根对象 */
+  ListInit(&obj->children);       /* 还没有子对象：空链，哨兵自指 */
+  ListInit(&obj->child_node);     /* 自己的挂载节点自成环：没挂在任何父对象下 */
+  obj->clip_children = 1u;           /* 默认裁子对象（LVGL 口径）；要溢出可见就显式置 0 */
+  obj->clip_radius   = 0u;           /* 默认矩形裁剪 */
   obj->activation = activated;       /* 默认激活：建好就是"可见可操作"的。
                                       * 要藏起来用 ui_obj_set_active(obj, 0)，
                                       * 藏起来之后绘制和操作两条遍历都会跳过它 */
@@ -92,6 +97,11 @@ ui_reg_result_t UI_RegisterObject_Chain(ui_chain_t* chain, ui_object_t* ui_obj, 
   }
 
   if(ui_obj->inited != 1)                      // 对象还没初始化：ops_node 不可信，注册后遍历会读到垃圾
+  {
+    return UI_REG_FAIL;
+  }
+
+  if(ui_obj->parent != NULL)                   // 已经是别人的子对象：由父对象带着画，不能再当根对象挂链
   {
     return UI_REG_FAIL;
   }
@@ -144,6 +154,11 @@ ui_reg_result_t UI_RegisterObject_Draw(ui_hierarchy_t* level, ui_object_t* ui_ob
     return UI_REG_FAIL;
   }
 
+  if(ui_obj->parent != NULL)                   // 已经是别人的子对象：不能同时进层级绘制表
+  {
+    return UI_REG_FAIL;
+  }
+
   if(ListLinked(&ui_obj->draw_node) != 0)      // 已经挂在某张绘制表上了，别重复挂
   {
     return UI_REG_FAIL;
@@ -182,6 +197,11 @@ ui_reg_result_t UI_RegisterObject_Node(ui_chain_t* chain, ui_object_t* ui_obj, u
   }
 
   if(ui_obj->inited != 1 || ui_obj->registered == 1)   // 对象没初始化 / 已经挂过链
+  {
+    return UI_REG_FAIL;
+  }
+
+  if(ui_obj->parent != NULL)                           // 已经是别人的子对象：不能再当根对象
   {
     return UI_REG_FAIL;
   }
@@ -277,6 +297,78 @@ void* UI_GetObject_Ext(ui_object_t* ui_obj, const void* key)
 
   return NULL;
 }
+
+/* 把 child 挂成 parent 的子对象：只动 parent->children，不碰链和层级绘制表。
+ * 子对象由父对象递归带着绘制 / 命中，所以不能再单独进 draws，否则会被画两遍。
+ * prev 非 NULL 时插在 prev 之后；NULL 插成第一个子对象（和其余注册接口口径一致） */
+ui_reg_result_t UI_RegisterObject_Child(ui_object_t* parent, ui_object_t* child, ui_object_t* prev)
+{
+  ui_object_t* p;
+
+  if(parent == NULL || child == NULL)          // 参数不合法
+  {
+    return UI_REG_FAIL;
+  }
+
+  if(parent->inited != 1 || child->inited != 1)// 两边都必须初始化过：children / child_node 才可信
+  {
+    return UI_REG_FAIL;
+  }
+
+  if(parent == child)                          // 自己不能当自己的父对象
+  {
+    return UI_REG_FAIL;
+  }
+
+  if(child->parent != NULL)                    // 已经有父对象了：先摘下来再挂
+  {
+    return UI_REG_FAIL;
+  }
+
+  if(child->registered == 1 || ListLinked(&child->draw_node) != 0)   // 只有根对象能变成子对象
+  {
+    return UI_REG_FAIL;
+  }
+
+  /* 不能成环：child 不能是 parent 的祖先（沿父链往上找一遍） */
+  for(p = parent; p != NULL; p = p->parent)
+  {
+    if(p == child)
+    {
+      return UI_REG_FAIL;
+    }
+  }
+
+  if(prev != NULL)
+  {
+    if(prev->parent != parent || ListLinked(&prev->child_node) == 0)  // prev 不在这个父对象的子链上
+    {
+      return UI_REG_FAIL;
+    }
+    ListInsertAfter(&prev->child_node, &child->child_node);
+  }
+  else
+  {
+    ListAdd(&parent->children, &child->child_node);   // 插成第一个子对象
+  }
+
+  child->parent = parent;                      /* 记下归属：绘制 / 命中 / 平移都靠它反查 */
+  return UI_REG_OK;
+}
+
+
+/* 把 child 从父对象的子链上摘下：只动这一层，child 自己的子树原样保留 */
+void UI_UnregisterObject_Child(ui_object_t* child)
+{
+  if(child == NULL || child->parent == NULL)   // 没对象 / 本来就没挂：无事可做
+  {
+    return;
+  }
+
+  ListDel(&child->child_node);                 // 摘完 child_node 自成环，可以重新挂
+  child->parent = NULL;
+}
+
 
 /* 注册一条 UI 链：把 chain 挂到 level 里、插在同一层级的上一条链 prev 之后
  *   prev 传 NULL：挂成本层级的第一条链，插到 level->chains 哨兵之后

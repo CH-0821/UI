@@ -632,10 +632,38 @@ static void ui_ctrl_active_children(ui_head_t* head, ui_activation_t st)
   }
 }
 
+/* 标记一个对象和它整棵子树的当前外接框。
+ * 隐藏 / 显示父对象时用：子对象可能伸出父框（clip_children = 0），
+ * 只标父框会在屏幕上留下子对象的残影 */
+static void ui_ctrl_mark_tree(ui_object_t* obj)
+{
+  ui_object_t* child;
+  int16_t cx, cy, w, h;
+
+  if(obj == NULL)
+  {
+    return;
+  }
+
+  if(ui_obj_frame(obj, &cx, &cy, &w, &h) != 0u)
+  {
+    ui_ctrl_mark_box_sym(cx, cy, w, h);
+  }
+
+  if(obj->inited != 1)                         /* 没初始化过：children 不可信，不往里走 */
+  {
+    return;
+  }
+
+  ListForEachEntry(child, &obj->children, ui_object_t, child_node)
+  {
+    ui_ctrl_mark_tree(child);
+  }
+}
+
 uint8_t ui_obj_set_active(ui_object_t *obj, uint8_t on)
 {
   ui_activation_t st = (on != 0u) ? activated : deactivated;
-  int16_t cx, cy, w, h;
 
   if(obj == NULL)
   {
@@ -648,11 +676,8 @@ uint8_t ui_obj_set_active(ui_object_t *obj, uint8_t on)
   }
 
   /* 记脏要用外接框，它只跟几何有关、跟激活状态无关，所以放在改状态之前取。
-   * 取不到框(para 还没配好)就不标 —— 它本来也没在屏幕上出现过 */
-  if(ui_obj_frame(obj, &cx, &cy, &w, &h) != 0u)
-  {
-    ui_ctrl_mark_box_sym(cx, cy, w, h);
-  }
+   * 子树可能伸出父框，一并标上；取不到框的(para 还没配好)跳过 —— 它本来也没在屏幕上出现过 */
+  ui_ctrl_mark_tree(obj);
 
   ui_ctrl_active_tree(obj, st);
   return 1;
@@ -1032,6 +1057,166 @@ uint8_t ui_obj_frame(ui_object_t* obj, int16_t* cx, int16_t* cy, int16_t* w, int
 
 
 /* ============================================================================
+ * 对象树绘制
+ * ========================================================================== */
+
+/* 取父对象的裁剪形状：外接框 + 圆角半径 + 角掩码。
+ *   圆形（含圆环进度条）-> 外接方框 + 当前外半径 + 四角全选 = 精确的圆；
+ *   矩形 / 组件        -> 它们自己的 corners / radius；
+ *   其它               -> 用 clip_radius 手工指定（0 = 直角）。
+ * 每次绘制现取，所以父对象缩放后外框和半径都自动跟着变。
+ * 返回 0 = 量不出框（para 为空 / 类型不登记），调用方就不压裁剪。 */
+static uint8_t ui_ctrl_clip_shape(ui_object_t* obj,
+                                  int16_t* x0, int16_t* y0, int16_t* x1, int16_t* y1,
+                                  int16_t* radius, uint8_t* corners)
+{
+  ui_head_t* head;
+  int16_t cx, cy, w, h;
+
+  if (obj == NULL || x0 == NULL || y0 == NULL || x1 == NULL || y1 == NULL ||
+      radius == NULL || corners == NULL)
+  {
+    return 0u;
+  }
+
+  if (ui_obj_frame(obj, &cx, &cy, &w, &h) == 0u)
+  {
+    return 0u;
+  }
+  ui_box_of(cx, cy, w, h, x0, y0, x1, y1);
+
+  *radius  = 0;
+  *corners = 0u;
+
+  /* 手工指定优先：给没有形状的容器（视窗 / 合并 / 文本…）强制一个圆角 */
+  if (obj->clip_radius > 0)
+  {
+    *radius  = obj->clip_radius;
+    *corners = UI_CLIP_ROUND_ALL;
+    return 1u;
+  }
+
+  head = (ui_head_t*)obj->para;
+
+  switch (head->type)
+  {
+    case UI_TYPE_CIRCLE:
+    {
+      ui_circle_para_t* p = (ui_circle_para_t*)head;
+
+      if (p->external_r > 0)
+      {
+        *radius  = p->external_r;
+        *corners = UI_CLIP_ROUND_ALL;
+      }
+      break;
+    }
+
+    case UI_TYPE_PROGRESS_BAR:
+    {
+      ui_progress_common_t* p = (ui_progress_common_t*)head;
+
+      if (p->shape == (uint8_t)UI_PROGRESS_SHAPE_CIRCLE)
+      {
+        ui_circle_progress_bar_para_t* c = (ui_circle_progress_bar_para_t*)head;
+
+        if (c->external_r > 0)
+        {
+          *radius  = c->external_r;
+          *corners = UI_CLIP_ROUND_ALL;
+        }
+      }
+      break;
+    }
+
+    case UI_TYPE_RECT:
+    case UI_TYPE_MODULE:
+    {
+      ui_rect_para_t* p = (ui_rect_para_t*)head;
+
+      if (p->corners != 0u && p->radius != 0u)
+      {
+        *radius  = (int16_t)p->radius;
+        *corners = p->corners;
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  return 1u;
+}
+
+/* 画一棵子树：先自己，再按顺序画子对象；父对象要求裁剪时先压裁剪区。
+ * 裁剪压的是父对象的【真实形状】（圆 / 圆角矩形，不是命中框），
+ * 所以子对象超出父对象的部分在这里被截掉，和画出来的形状逐像素对齐。
+ * 纯容器（para == NULL）没有自己的像素，但仍然会把子对象画出来 */
+static void ui_ctrl_draw_tree_obj(ui_object_t* obj, void (*visit)(ui_object_t* obj))
+{
+  ui_object_t* child;
+  int16_t x0, y0, x1, y1;
+  int16_t radius;
+  uint8_t corners;
+  uint8_t clipped = 0u;
+
+  if (obj == NULL || ui_obj_is_active(obj) == 0u)
+  {
+    return;
+  }
+
+  /* 父对象被藏起来时整棵子树都不画（子对象自己的 activation 保留，父对象恢复后照旧生效） */
+  if (obj->chain != NULL && obj->chain->activation == deactivated)
+  {
+    return;
+  }
+
+  if (obj->para != NULL)
+  {
+    visit(obj);                                /* 先画自己 */
+  }
+
+  if (ListEmpty(&obj->children) != 0u)
+  {
+    return;                                    /* 没有子对象：到此为止 */
+  }
+
+  if (obj->clip_children != 0u &&
+      ui_ctrl_clip_shape(obj, &x0, &y0, &x1, &y1, &radius, &corners) != 0u)
+  {
+    ui_row_clip_push_round_ex(x0, y0, x1, y1, radius, corners);
+    clipped = 1u;
+  }
+
+  ListForEachEntry(child, &obj->children, ui_object_t, child_node)
+  {
+    ui_ctrl_draw_tree_obj(child, visit);       /* 子对象画在父对象之上 */
+  }
+
+  if (clipped != 0u)
+  {
+    ui_row_clip_pop();
+  }
+}
+
+void ui_level_draw_tree(ui_hierarchy_t* level, void (*visit)(ui_object_t* obj))
+{
+  ui_object_t* obj;
+
+  if (level == NULL || visit == NULL)
+  {
+    return;
+  }
+
+  ListForEachEntry(obj, &level->draws, ui_object_t, draw_node)
+  {
+    ui_ctrl_draw_tree_obj(obj, visit);
+  }
+}
+
+
+/* ============================================================================
  * 命中测试
  * ========================================================================== */
 
@@ -1065,11 +1250,12 @@ static uint8_t ui_ctrl_hit_box(ui_object_t* obj, int16_t* x0, int16_t* y0, int16
   return 1u;
 }
 
-/* 在一条子对象链里找命中（前向声明：下面的 ui_ctrl_hit_object 要递归调它） */
+/* 在一条子对象链里找命中（前向声明：下面的 ui_ctrl_hit_object 要递归调它们） */
 static ui_object_t* ui_ctrl_hit_children(list_head_t* list, int16_t x, int16_t y);
+static ui_object_t* ui_ctrl_hit_object_children(list_head_t* list, int16_t x, int16_t y);
 
 /* 判断一个对象是不是命中点，是的话让 *hit 指向它 —— 也可能指向它的某个子对象。
- * 规则（视窗转派 / 合并对象不转派）见 ui_control.h 里 ui_hit_test 的说明 */
+ * 规则（父子对象 / 视窗转派 / 合并对象不转派）见 ui_control.h 里 ui_hit_test 的说明 */
 static uint8_t ui_ctrl_hit_object(ui_object_t* obj, int16_t x, int16_t y, ui_object_t** hit)
 {
   ui_head_t* head;
@@ -1092,38 +1278,75 @@ static uint8_t ui_ctrl_hit_object(ui_object_t* obj, int16_t x, int16_t y, ui_obj
     return 0;
   }
 
+  /* ① 对象树：子对象画在自己之上，先让子对象接。
+   * clip_children = 1 时，点必须落在父对象的【真实形状】内（圆 / 圆角矩形）——
+   * 否则子树被裁掉了，一个像素都看不见，也不该被点到。这里刻意不用命中框：
+   * 命中框带了最小可点补齐，会把"父框外一点点"也放进来，和绘制裁剪对不上 */
+  if (ListEmpty(&obj->children) == 0u)
+  {
+    uint8_t allow = 1u;
+
+    if (obj->clip_children != 0u)
+    {
+      int16_t radius;
+      uint8_t corners;
+
+      if (ui_ctrl_clip_shape(obj, &x0, &y0, &x1, &y1, &radius, &corners) == 0u ||
+          ui_clip_shape_contains(x0, y0, x1, y1, radius, corners, x, y) == 0u)
+      {
+        allow = 0u;                              /* 量不出形状 / 点不在形状内：子树不参与命中 */
+      }
+    }
+
+    if (allow != 0u)
+    {
+      ui_object_t* child = ui_ctrl_hit_object_children(&obj->children, x, y);
+
+      if (child != NULL)
+      {
+        *hit = child;
+        return 1;
+      }
+    }
+  }
+
+  head = (ui_head_t*)obj->para;
+
+  /* ② 视窗（旧容器）：子对象挂在 para->list 上。同样要求点落在窗口内，
+   * 和绘制裁剪一致；这里不看自己的 cb，否则没挂回调的视窗会挡住子对象 */
+  if (head != NULL && head->type == UI_TYPE_VIEWPORT)
+  {
+    int16_t cx, cy, w, h;
+    ui_object_t* child;
+
+    if (ui_obj_frame(obj, &cx, &cy, &w, &h) != 0u)
+    {
+      ui_box_of(cx, cy, w, h, &x0, &y0, &x1, &y1);
+      if (x >= x0 && x <= x1 && y >= y0 && y <= y1)
+      {
+        child = ui_ctrl_hit_children(&((ui_viewport_para_t*)head)->list, x, y);
+        if (child != NULL)
+        {
+          *hit = child;
+          return 1;
+        }
+      }
+    }
+  }
+  /* 合并对象不转派：它就是一个组件，只是由不同子对象渲染而来 */
+
+  /* ③ 自己：命中框 = 真实外框 + 最小可点补齐 */
+  if (obj->cb == NULL)                             /* 自己没挂回调 = 不可命中，当透明穿透过去 */
+  {
+    return 0;
+  }
+
   if (ui_ctrl_hit_box(obj, &x0, &y0, &x1, &y1) == 0u)   /* 量不出框就不命中 */
   {
     return 0;
   }
 
   if (x < x0 || x > x1 || y < y0 || y > y1)
-  {
-    return 0;
-  }
-
-  head = (ui_head_t*)obj->para;
-
-  /* 视窗：先问里面的子对象。能走到这一步说明点已经落在窗口矩形内了（视窗的框
-   * 就是窗口本身），所以"窗口外的子对象不该被点到"和绘制裁剪天然一致，不用再夹一次。
-   *
-   * 【注意这里不看自己的 cb】—— 视窗自己没挂回调也必须先转派，否则它会把
-   * 子对象的命中机会一起挡掉 */
-  if (head->type == UI_TYPE_VIEWPORT)
-  {
-    ui_object_t* child;
-
-    child = ui_ctrl_hit_children(&((ui_viewport_para_t*)head)->list, x, y);
-    if (child != NULL)
-    {
-      *hit = child;
-      return 1;
-    }
-    /* 子对象都没中，才轮到视窗自己 */
-  }
-  /* 合并对象不转派：它就是一个组件，只是由不同子对象渲染而来 */
-
-  if (obj->cb == NULL)                             /* 自己没挂回调 = 不可命中，当透明穿透过去 */
   {
     return 0;
   }
@@ -1147,6 +1370,29 @@ static ui_object_t* ui_ctrl_hit_children(list_head_t* list, int16_t x, int16_t y
     ui_object_t* hit = NULL;
 
     if (ui_ctrl_hit_object(it->obj, x, y, &hit) != 0u)
+    {
+      return hit;
+    }
+  }
+
+  return NULL;
+}
+
+/* 在对象树的 children 里找命中：同样倒着走 —— 后挂的子对象画在上层，先被点到 */
+static ui_object_t* ui_ctrl_hit_object_children(list_head_t* list, int16_t x, int16_t y)
+{
+  ui_object_t* it;
+
+  if (list == NULL)
+  {
+    return NULL;
+  }
+
+  ListForEachEntryReverse(it, list, ui_object_t, child_node)
+  {
+    ui_object_t* hit = NULL;
+
+    if (ui_ctrl_hit_object(it, x, y, &hit) != 0u)
     {
       return hit;
     }

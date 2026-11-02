@@ -652,32 +652,56 @@ static const anim_move_obj_fn_t anim_move_obj_tab[] =
 
 
 
+/* 平移：自己按类型挪完，把同样的位移传给整棵子树。
+ * 子对象跟着父对象走、各自按自己的类型标脏；父对象移动不改变子对象相对它的位置。
+ * 父对象缩放不走这里 —— 缩放只改父对象自己的外接框（裁剪范围），子对象不动 */
 void ui_anim_move_obj(ui_object_t *obj, int16_t delta_x, int16_t delta_y)
 {
-  ui_type_t type = ui_obj_analysis_type(obj);
+  ui_object_t *child;
+  ui_type_t type;
   anim_move_obj_fn_t fn;
   int16_t dx = delta_x, dy = delta_y;
 
-  if (type == UI_TYPE_NONE)
+  if (obj == NULL || obj->inited != 1)
+  {
+    return;
+  }
+  if (dx == 0 && dy == 0)
   {
     return;
   }
 
-  /* type 可能没赋过值甚至被写坏，先把下标夹在表内再查 */
-  if ((unsigned)type >= sizeof(anim_move_obj_tab) / sizeof(anim_move_obj_tab[0]))
+  if (obj->para != NULL)
+  {
+    type = ui_obj_analysis_type(obj);
+
+    if (type == UI_TYPE_NONE ||
+        (unsigned)type >= sizeof(anim_move_obj_tab) / sizeof(anim_move_obj_tab[0]))
+    {
+      return;
+    }
+
+    fn = anim_move_obj_tab[type];
+
+    /* 表里没登记（NULL）：这个类型不支持平移，连子树也不动 */
+    if (fn == NULL)
+    {
+      return;
+    }
+
+    fn(obj->para, &dx, &dy);
+  }
+
+  if (dx == 0 && dy == 0)
   {
     return;
   }
 
-  fn = anim_move_obj_tab[type];
-
-  /* 表里没登记（NULL）：这个类型不支持平移，什么都不动 */
-  if (fn == NULL)
+  ListForEachEntry(child, &obj->children, ui_object_t, child_node)
   {
-    return;
+    ui_anim_move_obj_shift(child, dx, dy);     /* 有平移动画的，轨迹一起挪 */
+    ui_anim_move_obj(child, dx, dy);
   }
-
-  fn(obj->para, &dx, &dy);
 }
 
 
@@ -1312,7 +1336,7 @@ void ui_anim_scale_obj(ui_object_t *obj, uint16_t num, uint16_t den)
   anim_scale_obj_fn_t fn;
   uint16_t n = num, d = den;
 
-  if (type == UI_TYPE_NONE)
+  if (obj == NULL || obj->inited != 1 || type == UI_TYPE_NONE)
   {
     return;
   }
@@ -1325,7 +1349,9 @@ void ui_anim_scale_obj(ui_object_t *obj, uint16_t num, uint16_t den)
 
   fn = anim_scale_obj_tab[type];
 
-  /* 表里没登记（NULL）：这个类型不支持缩放，什么都不动 */
+  /* 表里没登记（NULL）：这个类型不支持缩放，什么都不动。
+   * 子对象【不跟着缩放】—— 图片 / 文字点阵没有缩放能力；
+   * 父对象缩放只改它自己的外接框，也就只改子对象的裁剪范围 */
   if (fn == NULL)
   {
     return;
@@ -1334,6 +1360,76 @@ void ui_anim_scale_obj(ui_object_t *obj, uint16_t num, uint16_t den)
   fn(obj->para, &n, &d);
 }
 
+
+uint8_t ui_obj_set_pos_rel(ui_object_t *obj, int16_t dx, int16_t dy)
+{
+  ui_object_t *parent;
+  int16_t pcx, pcy, pw, ph;
+  int16_t ccx, ccy, cw, ch;
+  int16_t mvx, mvy;
+
+  if (obj == NULL || obj->inited != 1)
+  {
+    return 0u;
+  }
+
+  parent = obj->parent;
+  if (parent == NULL || parent->inited != 1)
+  {
+    return 0u;
+  }
+
+  if (ui_obj_frame(parent, &pcx, &pcy, &pw, &ph) == 0u ||
+      ui_obj_frame(obj, &ccx, &ccy, &cw, &ch) == 0u)
+  {
+    return 0u;
+  }
+
+  mvx = (int16_t)((pcx + dx) - ccx);
+  mvy = (int16_t)((pcy + dy) - ccy);
+  if (mvx != 0 || mvy != 0)
+  {
+    ui_anim_move_obj(obj, mvx, mvy);           /* 子对象连同它自己的子树一起走 */
+  }
+
+  return 1u;
+}
+
+uint8_t ui_obj_set_pos(ui_object_t *obj, int16_t x, int16_t y)
+{
+  ui_object_t *parent;
+  int16_t pcx, pcy, pw, ph;
+  int16_t ccx, ccy, cw, ch;
+  int16_t px0, py0, px1, py1;
+
+  if (obj == NULL || obj->inited != 1)
+  {
+    return 0u;
+  }
+
+  parent = obj->parent;
+  if (parent == NULL || parent->inited != 1)
+  {
+    return 0u;
+  }
+
+  if (ui_obj_frame(parent, &pcx, &pcy, &pw, &ph) == 0u)
+  {
+    return 0u;                                  /* 父对象没框：没有"左上角"可用 */
+  }
+
+  ui_box_of(pcx, pcy, pw, ph, &px0, &py0, &px1, &py1);
+
+  if (ui_obj_frame(obj, &ccx, &ccy, &cw, &ch) == 0u)
+  {
+    return 0u;                                  /* 子对象量不出框（如光标）：摆不了 */
+  }
+
+  /* 目标中心 = 父对象左上角 + (x, y) + 自身半宽/半高 */
+  return ui_obj_set_pos_rel(obj,
+                            (int16_t)((px0 + x + (cw >> 1)) - pcx),
+                            (int16_t)((py0 + y + (ch >> 1)) - pcy));
+}
 
 /* ui_anim 在框架那边的扩展身份：拿本文件一个静态对象的地址当 key，
  * 只有 ui_anim 自己认得出，外部看不见 */
